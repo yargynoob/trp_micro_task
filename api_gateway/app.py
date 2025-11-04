@@ -2,11 +2,19 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 import requests
 import os
+import uuid
 from datetime import datetime, timedelta
 import threading
+from auth_middleware import require_auth, add_auth_headers, is_public_route
 
 app = Flask(__name__)
 CORS(app)
+
+@app.before_request
+def add_request_id():
+    """Добавление X-Request-ID к каждому запросу"""
+    if not request.headers.get('X-Request-ID'):
+        request.environ['HTTP_X_REQUEST_ID'] = str(uuid.uuid4())
 
 PORT = int(os.environ.get('PORT', 8000))
 USERS_SERVICE_URL = os.environ.get('USERS_SERVICE_URL', 'http://service_users:8001')
@@ -17,7 +25,7 @@ class CircuitBreaker:
         self.timeout = timeout
         self.error_threshold = error_threshold
         self.reset_timeout = reset_timeout
-        self.min_requests = min_requests  # Минимум запросов перед открытием
+        self.min_requests = min_requests
         self.failure_count = 0
         self.success_count = 0
         self.last_failure_time = None
@@ -47,7 +55,6 @@ class CircuitBreaker:
                 self.failure_count += 1
                 self.last_failure_time = datetime.now()
                 total = self.failure_count + self.success_count
-                # Открываем только если превышен минимальный порог запросов
                 if total >= self.min_requests and self.failure_count / total >= self.error_threshold:
                     self.state = 'open'
                     print(f'Circuit breaker opened after {total} requests')
@@ -58,7 +65,8 @@ orders_circuit = CircuitBreaker()
 
 def call_users_service(url, method='GET', data=None):
     try:
-        response = requests.request(method, url, json=data, timeout=3)
+        headers = add_auth_headers()
+        response = requests.request(method, url, json=data, headers=headers, timeout=3)
         if response.status_code == 404:
             return response.json(), response.status_code
         response.raise_for_status()
@@ -68,7 +76,8 @@ def call_users_service(url, method='GET', data=None):
 
 def call_orders_service(url, method='GET', data=None):
     try:
-        response = requests.request(method, url, json=data, timeout=3)
+        headers = add_auth_headers()
+        response = requests.request(method, url, json=data, headers=headers, timeout=3)
         if response.status_code == 404:
             return response.json(), response.status_code
         response.raise_for_status()
@@ -76,82 +85,117 @@ def call_orders_service(url, method='GET', data=None):
     except Exception as e:
         raise e
 
-@app.route('/users/<user_id>', methods=['GET'])
+@app.route('/v1/users/register', methods=['POST'])
+def register():
+    try:
+        result, status = users_circuit.call(call_users_service, f'{USERS_SERVICE_URL}/v1/users/register', 'POST', request.json)
+        return jsonify(result), status
+    except:
+        return jsonify({'success': False, 'error': {'code': 'SERVICE_UNAVAILABLE', 'message': 'Users service temporarily unavailable'}}), 503
+
+@app.route('/v1/users/login', methods=['POST'])
+def login():
+    try:
+        result, status = users_circuit.call(call_users_service, f'{USERS_SERVICE_URL}/v1/users/login', 'POST', request.json)
+        return jsonify(result), status
+    except:
+        return jsonify({'success': False, 'error': {'code': 'SERVICE_UNAVAILABLE', 'message': 'Users service temporarily unavailable'}}), 503
+
+@app.route('/v1/users/profile', methods=['GET'])
+@require_auth
+def get_profile():
+    try:
+        result, status = users_circuit.call(call_users_service, f'{USERS_SERVICE_URL}/v1/users/profile')
+        return jsonify(result), status
+    except:
+        return jsonify({'success': False, 'error': {'code': 'SERVICE_UNAVAILABLE', 'message': 'Users service temporarily unavailable'}}), 503
+
+@app.route('/v1/users/profile', methods=['PUT'])
+@require_auth
+def update_profile():
+    try:
+        result, status = users_circuit.call(call_users_service, f'{USERS_SERVICE_URL}/v1/users/profile', 'PUT', request.json)
+        return jsonify(result), status
+    except:
+        return jsonify({'success': False, 'error': {'code': 'SERVICE_UNAVAILABLE', 'message': 'Users service temporarily unavailable'}}), 503
+
+@app.route('/v1/users/<user_id>', methods=['GET'])
+@require_auth
 def get_user(user_id):
     try:
-        result, status = users_circuit.call(call_users_service, f'{USERS_SERVICE_URL}/users/{user_id}')
+        result, status = users_circuit.call(call_users_service, f'{USERS_SERVICE_URL}/v1/users/{user_id}')
         return jsonify(result), status
     except:
         return jsonify({'success': False, 'error': {'code': 'SERVICE_UNAVAILABLE', 'message': 'Users service temporarily unavailable'}}), 503
 
-@app.route('/users', methods=['POST'])
-def create_user():
-    try:
-        result, status = users_circuit.call(call_users_service, f'{USERS_SERVICE_URL}/users', 'POST', request.json)
-        return jsonify(result), status
-    except:
-        return jsonify({'success': False, 'error': {'code': 'SERVICE_UNAVAILABLE', 'message': 'Users service temporarily unavailable'}}), 503
-
-@app.route('/users', methods=['GET'])
+@app.route('/v1/users', methods=['GET'])
+@require_auth
 def get_users():
     try:
-        result, status = users_circuit.call(call_users_service, f'{USERS_SERVICE_URL}/users')
+        result, status = users_circuit.call(call_users_service, f'{USERS_SERVICE_URL}/v1/users')
         return jsonify(result), status
     except:
         return jsonify({'success': False, 'error': {'code': 'SERVICE_UNAVAILABLE', 'message': 'Users service temporarily unavailable'}}), 503
 
-@app.route('/users/<user_id>', methods=['DELETE'])
+@app.route('/v1/users/<user_id>', methods=['DELETE'])
+@require_auth
 def delete_user(user_id):
     try:
-        result, status = users_circuit.call(call_users_service, f'{USERS_SERVICE_URL}/users/{user_id}', 'DELETE')
+        result, status = users_circuit.call(call_users_service, f'{USERS_SERVICE_URL}/v1/users/{user_id}', 'DELETE')
         return jsonify(result), status
     except:
         return jsonify({'success': False, 'error': {'code': 'SERVICE_UNAVAILABLE', 'message': 'Users service temporarily unavailable'}}), 503
 
-@app.route('/users/<user_id>', methods=['PUT'])
+@app.route('/v1/users/<user_id>', methods=['PUT'])
+@require_auth
 def update_user(user_id):
     try:
-        result, status = users_circuit.call(call_users_service, f'{USERS_SERVICE_URL}/users/{user_id}', 'PUT', request.json)
+        result, status = users_circuit.call(call_users_service, f'{USERS_SERVICE_URL}/v1/users/{user_id}', 'PUT', request.json)
         return jsonify(result), status
     except:
         return jsonify({'success': False, 'error': {'code': 'SERVICE_UNAVAILABLE', 'message': 'Users service temporarily unavailable'}}), 503
 
-@app.route('/orders/<order_id>', methods=['GET'])
+@app.route('/v1/orders/<order_id>', methods=['GET'])
+@require_auth
 def get_order(order_id):
     try:
-        result, status = orders_circuit.call(call_orders_service, f'{ORDERS_SERVICE_URL}/orders/{order_id}')
+        result, status = orders_circuit.call(call_orders_service, f'{ORDERS_SERVICE_URL}/v1/orders/{order_id}')
         return jsonify(result), status
     except:
         return jsonify({'success': False, 'error': {'code': 'SERVICE_UNAVAILABLE', 'message': 'Orders service temporarily unavailable'}}), 503
 
-@app.route('/orders', methods=['POST'])
+@app.route('/v1/orders', methods=['POST'])
+@require_auth
 def create_order():
     try:
-        result, status = orders_circuit.call(call_orders_service, f'{ORDERS_SERVICE_URL}/orders', 'POST', request.json)
+        result, status = orders_circuit.call(call_orders_service, f'{ORDERS_SERVICE_URL}/v1/orders', 'POST', request.json)
         return jsonify(result), status
     except:
         return jsonify({'success': False, 'error': {'code': 'SERVICE_UNAVAILABLE', 'message': 'Orders service temporarily unavailable'}}), 503
 
-@app.route('/orders', methods=['GET'])
+@app.route('/v1/orders', methods=['GET'])
+@require_auth
 def get_orders():
     try:
-        result, status = orders_circuit.call(call_orders_service, f'{ORDERS_SERVICE_URL}/orders')
+        result, status = orders_circuit.call(call_orders_service, f'{ORDERS_SERVICE_URL}/v1/orders')
         return jsonify(result), status
     except:
         return jsonify({'success': False, 'error': {'code': 'SERVICE_UNAVAILABLE', 'message': 'Orders service temporarily unavailable'}}), 503
 
-@app.route('/orders/<order_id>', methods=['DELETE'])
+@app.route('/v1/orders/<order_id>', methods=['DELETE'])
+@require_auth
 def delete_order(order_id):
     try:
-        result, status = orders_circuit.call(call_orders_service, f'{ORDERS_SERVICE_URL}/orders/{order_id}', 'DELETE')
+        result, status = orders_circuit.call(call_orders_service, f'{ORDERS_SERVICE_URL}/v1/orders/{order_id}', 'DELETE')
         return jsonify(result), status
     except:
         return jsonify({'success': False, 'error': {'code': 'SERVICE_UNAVAILABLE', 'message': 'Orders service temporarily unavailable'}}), 503
 
-@app.route('/orders/<order_id>', methods=['PUT'])
+@app.route('/v1/orders/<order_id>', methods=['PUT'])
+@require_auth
 def update_order(order_id):
     try:
-        result, status = orders_circuit.call(call_orders_service, f'{ORDERS_SERVICE_URL}/orders/{order_id}', 'PUT', request.json)
+        result, status = orders_circuit.call(call_orders_service, f'{ORDERS_SERVICE_URL}/v1/orders/{order_id}', 'PUT', request.json)
         return jsonify(result), status
     except:
         return jsonify({'success': False, 'error': {'code': 'SERVICE_UNAVAILABLE', 'message': 'Orders service temporarily unavailable'}}), 503
@@ -172,14 +216,15 @@ def orders_health():
     except:
         return jsonify({'error': 'Internal server error'}), 500
 
-@app.route('/users/<user_id>/details', methods=['GET'])
+@app.route('/v1/users/<user_id>/details', methods=['GET'])
+@require_auth
 def get_user_details(user_id):
     try:
-        user_result, user_status = users_circuit.call(call_users_service, f'{USERS_SERVICE_URL}/users/{user_id}')
+        user_result, user_status = users_circuit.call(call_users_service, f'{USERS_SERVICE_URL}/v1/users/{user_id}')
         if user_status == 404:
             return jsonify(user_result), user_status
         
-        orders_result, _ = orders_circuit.call(call_orders_service, f'{ORDERS_SERVICE_URL}/orders?userId={user_id}')
+        orders_result, _ = orders_circuit.call(call_orders_service, f'{ORDERS_SERVICE_URL}/v1/orders?userId={user_id}')
         
         user_data = user_result.get('data', user_result) if isinstance(user_result, dict) else user_result
         orders_data = orders_result.get('data', []) if isinstance(orders_result, dict) else orders_result
