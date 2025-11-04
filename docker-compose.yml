@@ -1,27 +1,63 @@
 services:
-  api_gateway:
-    build: api_gateway
-    ports:
-      - "8000:8000"
+  postgres:
+    image: postgres:15-alpine
     environment:
-      - NODE_ENV=production
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: trp_microservices
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
     networks:
       - app-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
   service_users:
     build: service_users
     environment:
-      - NODE_ENV=production
+      - PORT=8001
+      - DATABASE_URL=postgresql://postgres:postgres@postgres:5432/trp_microservices
+      - JWT_SECRET=your-secret-key-change-in-production
     networks:
       - app-network
+    depends_on:
+      postgres:
+        condition: service_healthy
 
   service_orders:
     build: service_orders
     environment:
-      - NODE_ENV=production
+      - PORT=8002
+      - DATABASE_URL=postgresql://postgres:postgres@postgres:5432/trp_microservices
+      - USERS_SERVICE_URL=http://service_users:8001
     networks:
       - app-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api_gateway:
+    build: api_gateway
+    ports:
+      - "8080:8000"
+    environment:
+      - PORT=8000
+      - USERS_SERVICE_URL=http://service_users:8001
+      - ORDERS_SERVICE_URL=http://service_orders:8002
+    networks:
+      - app-network
+    depends_on:
+      - service_users
+      - service_orders
 
 networks:
   app-network:
     driver: bridge
+
+volumes:
+  postgres_data:
