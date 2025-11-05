@@ -6,7 +6,8 @@ from sqlalchemy.orm import Session
 from database import SessionLocal, init_db
 from models import User
 from auth import hash_password, verify_password, create_access_token, require_auth, require_role
-from schemas import UserRegister, UserLogin
+from schemas import UserRegister, UserLogin, UserUpdate, PasswordChange, UserRoleUpdate, UserSearch
+from pydantic import ValidationError
 import uuid
 
 app = Flask(__name__)
@@ -224,11 +225,45 @@ def update_profile():
 @app.route('/v1/users', methods=['GET'])
 @require_role('admin')
 def get_users():
-    """Получение списка всех пользователей"""
+    """Получение списка пользователей с пагинацией и поиском"""
     db = SessionLocal()
     try:
-        users = db.query(User).all()
-        return jsonify({'success': True, 'data': [user.to_dict() for user in users]}), 200
+        # Параметры пагинации
+        page = int(request.args.get('page', 1))
+        per_page = min(int(request.args.get('per_page', 10)), 100)
+        
+        # Поиск
+        query = db.query(User)
+        search_query = request.args.get('query', '').strip()
+        if search_query:
+            search_pattern = f'%{search_query}%'
+            query = query.filter(
+                (User.name.ilike(search_pattern)) | 
+                (User.email.ilike(search_pattern))
+            )
+        
+        # Фильтр по роли
+        role = request.args.get('role')
+        if role:
+            query = query.filter(User.roles.contains([role]))
+        
+        # Подсчет общего количества
+        total = query.count()
+        
+        # Пагинация
+        offset = (page - 1) * per_page
+        users = query.offset(offset).limit(per_page).all()
+        
+        return jsonify({
+            'success': True,
+            'data': [user.to_dict() for user in users],
+            'pagination': {
+                'page': page,
+                'per_page': per_page,
+                'total': total,
+                'pages': (total + per_page - 1) // per_page
+            }
+        }), 200
     except Exception as e:
         return jsonify({'success': False, 'error': {'code': 'INTERNAL_ERROR', 'message': str(e)}}), 500
     finally:
@@ -314,6 +349,223 @@ def delete_user(user_id):
     except Exception as e:
         db.rollback()
         return jsonify({'success': False, 'error': {'code': 'INTERNAL_ERROR', 'message': str(e)}}), 500
+    finally:
+        db.close()
+
+@app.route('/v1/users/profile/password', methods=['PUT'])
+@require_auth
+def change_password():
+    """Изменение пароля текущего пользователя"""
+    db = SessionLocal()
+    try:
+        data = request.json
+        
+        # Валидация
+        try:
+            password_data = PasswordChange(**data)
+        except ValidationError as e:
+            return jsonify({
+                'success': False,
+                'error': {
+                    'code': 'VALIDATION_ERROR',
+                    'message': str(e.errors()[0]['msg'])
+                }
+            }), 400
+        
+        user_id = request.user.get('user_id')
+        user = db.query(User).filter(User.id == uuid.UUID(user_id)).first()
+        
+        if not user:
+            return jsonify({
+                'success': False,
+                'error': {
+                    'code': 'NOT_FOUND',
+                    'message': 'User not found'
+                }
+            }), 404
+        
+        # Проверка старого пароля
+        if not verify_password(password_data.old_password, user.password_hash):
+            return jsonify({
+                'success': False,
+                'error': {
+                    'code': 'INVALID_CREDENTIALS',
+                    'message': 'Old password is incorrect'
+                }
+            }), 401
+        
+        # Установка нового пароля
+        user.password_hash = hash_password(password_data.new_password)
+        db.commit()
+        
+        return jsonify({
+            'success': True,
+            'data': {
+                'message': 'Password changed successfully'
+            }
+        }), 200
+    except Exception as e:
+        db.rollback()
+        return jsonify({
+            'success': False,
+            'error': {
+                'code': 'INTERNAL_ERROR',
+                'message': str(e)
+            }
+        }), 500
+    finally:
+        db.close()
+
+@app.route('/v1/users/<user_id>/roles', methods=['PUT'])
+@require_role('admin')
+def update_user_roles(user_id):
+    """Обновление ролей пользователя (только admin)"""
+    db = SessionLocal()
+    try:
+        data = request.json
+        
+        # Валидация
+        try:
+            role_data = UserRoleUpdate(**data)
+        except ValidationError as e:
+            return jsonify({
+                'success': False,
+                'error': {
+                    'code': 'VALIDATION_ERROR',
+                    'message': str(e.errors()[0]['msg'])
+                }
+            }), 400
+        
+        user = db.query(User).filter(User.id == uuid.UUID(user_id)).first()
+        if not user:
+            return jsonify({
+                'success': False,
+                'error': {
+                    'code': 'NOT_FOUND',
+                    'message': 'User not found'
+                }
+            }), 404
+        
+        user.roles = role_data.roles
+        db.commit()
+        db.refresh(user)
+        
+        return jsonify({
+            'success': True,
+            'data': {
+                'user': user.to_dict(),
+                'message': 'User roles updated successfully'
+            }
+        }), 200
+    except ValueError:
+        return jsonify({
+            'success': False,
+            'error': {
+                'code': 'INVALID_UUID',
+                'message': 'Invalid user ID format'
+            }
+        }), 400
+    except Exception as e:
+        db.rollback()
+        return jsonify({
+            'success': False,
+            'error': {
+                'code': 'INTERNAL_ERROR',
+                'message': str(e)
+            }
+        }), 500
+    finally:
+        db.close()
+
+@app.route('/v1/users/search', methods=['GET'])
+@require_auth
+def search_users():
+    """Поиск пользователей по имени или email"""
+    db = SessionLocal()
+    try:
+        search_query = request.args.get('q', '').strip()
+        page = int(request.args.get('page', 1))
+        per_page = min(int(request.args.get('per_page', 10)), 100)
+        
+        if not search_query:
+            return jsonify({
+                'success': False,
+                'error': {
+                    'code': 'VALIDATION_ERROR',
+                    'message': 'Search query is required (parameter: q)'
+                }
+            }), 400
+        
+        if len(search_query) < 2:
+            return jsonify({
+                'success': False,
+                'error': {
+                    'code': 'VALIDATION_ERROR',
+                    'message': 'Search query must be at least 2 characters'
+                }
+            }), 400
+        
+        search_pattern = f'%{search_query}%'
+        query = db.query(User).filter(
+            (User.name.ilike(search_pattern)) | 
+            (User.email.ilike(search_pattern))
+        )
+        
+        total = query.count()
+        offset = (page - 1) * per_page
+        users = query.offset(offset).limit(per_page).all()
+        
+        return jsonify({
+            'success': True,
+            'data': [user.to_dict() for user in users],
+            'pagination': {
+                'page': page,
+                'per_page': per_page,
+                'total': total,
+                'pages': (total + per_page - 1) // per_page
+            }
+        }), 200
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': {
+                'code': 'INTERNAL_ERROR',
+                'message': str(e)
+            }
+        }), 500
+    finally:
+        db.close()
+
+@app.route('/v1/users/stats', methods=['GET'])
+@require_role('admin')
+def get_stats():
+    """Получение статистики по пользователям (только admin)"""
+    db = SessionLocal()
+    try:
+        total_users = db.query(User).count()
+        admin_users = db.query(User).filter(User.roles.contains(['admin'])).count()
+        regular_users = total_users - admin_users
+        
+        # Последние зарегистрированные
+        recent_users = db.query(User).order_by(User.created_at.desc()).limit(5).all()
+        
+        return jsonify({
+            'success': True,
+            'data': {
+                'total_users': total_users,
+                'admin_users': admin_users,
+                'regular_users': regular_users,
+                'recent_users': [user.to_dict() for user in recent_users]
+            }
+        }), 200
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': {
+                'code': 'INTERNAL_ERROR',
+                'message': str(e)
+            }
+        }), 500
     finally:
         db.close()
 

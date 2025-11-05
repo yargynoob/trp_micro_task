@@ -132,7 +132,22 @@ def get_user(user_id):
 @require_auth
 def get_users():
     try:
-        result, status = users_circuit.call(call_users_service, f'{USERS_SERVICE_URL}/v1/users')
+        # Передаем query parameters
+        query_string = ''
+        if request.args:
+            params = []
+            if request.args.get('page'):
+                params.append(f"page={request.args.get('page')}")
+            if request.args.get('per_page'):
+                params.append(f"per_page={request.args.get('per_page')}")
+            if request.args.get('query'):
+                params.append(f"query={request.args.get('query')}")
+            if request.args.get('role'):
+                params.append(f"role={request.args.get('role')}")
+            if params:
+                query_string = '?' + '&'.join(params)
+        
+        result, status = users_circuit.call(call_users_service, f'{USERS_SERVICE_URL}/v1/users{query_string}')
         return jsonify(result), status
     except:
         return jsonify({'success': False, 'error': {'code': 'SERVICE_UNAVAILABLE', 'message': 'Users service temporarily unavailable'}}), 503
@@ -151,6 +166,58 @@ def delete_user(user_id):
 def update_user(user_id):
     try:
         result, status = users_circuit.call(call_users_service, f'{USERS_SERVICE_URL}/v1/users/{user_id}', 'PUT', request.json)
+        return jsonify(result), status
+    except:
+        return jsonify({'success': False, 'error': {'code': 'SERVICE_UNAVAILABLE', 'message': 'Users service temporarily unavailable'}}), 503
+
+@app.route('/v1/users/profile/password', methods=['PUT'])
+@require_auth
+def change_password():
+    """Изменение пароля"""
+    try:
+        result, status = users_circuit.call(call_users_service, f'{USERS_SERVICE_URL}/v1/users/profile/password', 'PUT', request.json)
+        return jsonify(result), status
+    except:
+        return jsonify({'success': False, 'error': {'code': 'SERVICE_UNAVAILABLE', 'message': 'Users service temporarily unavailable'}}), 503
+
+@app.route('/v1/users/<user_id>/roles', methods=['PUT'])
+@require_auth
+def update_user_roles(user_id):
+    """Обновление ролей"""
+    try:
+        result, status = users_circuit.call(call_users_service, f'{USERS_SERVICE_URL}/v1/users/{user_id}/roles', 'PUT', request.json)
+        return jsonify(result), status
+    except:
+        return jsonify({'success': False, 'error': {'code': 'SERVICE_UNAVAILABLE', 'message': 'Users service temporarily unavailable'}}), 503
+
+@app.route('/v1/users/search', methods=['GET'])
+@require_auth
+def search_users():
+    """Поиск пользователей"""
+    try:
+        query_string = ''
+        if request.args:
+            params = []
+            if request.args.get('q'):
+                params.append(f"q={request.args.get('q')}")
+            if request.args.get('page'):
+                params.append(f"page={request.args.get('page')}")
+            if request.args.get('per_page'):
+                params.append(f"per_page={request.args.get('per_page')}")
+            if params:
+                query_string = '?' + '&'.join(params)
+        
+        result, status = users_circuit.call(call_users_service, f'{USERS_SERVICE_URL}/v1/users/search{query_string}')
+        return jsonify(result), status
+    except:
+        return jsonify({'success': False, 'error': {'code': 'SERVICE_UNAVAILABLE', 'message': 'Users service temporarily unavailable'}}), 503
+
+@app.route('/v1/users/stats', methods=['GET'])
+@require_auth
+def get_user_stats():
+    """Статистика пользователей"""
+    try:
+        result, status = users_circuit.call(call_users_service, f'{USERS_SERVICE_URL}/v1/users/stats')
         return jsonify(result), status
     except:
         return jsonify({'success': False, 'error': {'code': 'SERVICE_UNAVAILABLE', 'message': 'Users service temporarily unavailable'}}), 503
