@@ -132,7 +132,6 @@ def get_user(user_id):
 @require_auth
 def get_users():
     try:
-        # Передаем query parameters
         query_string = ''
         if request.args:
             params = []
@@ -244,7 +243,29 @@ def create_order():
 @require_auth
 def get_orders():
     try:
-        result, status = orders_circuit.call(call_orders_service, f'{ORDERS_SERVICE_URL}/v1/orders')
+        query_string = ''
+        if request.args:
+            params = []
+            if request.args.get('page'):
+                params.append(f"page={request.args.get('page')}")
+            if request.args.get('per_page'):
+                params.append(f"per_page={request.args.get('per_page')}")
+            if request.args.get('userId'):
+                params.append(f"userId={request.args.get('userId')}")
+            if request.args.get('status'):
+                params.append(f"status={request.args.get('status')}")
+            if request.args.get('min_amount'):
+                params.append(f"min_amount={request.args.get('min_amount')}")
+            if request.args.get('max_amount'):
+                params.append(f"max_amount={request.args.get('max_amount')}")
+            if request.args.get('sort_by'):
+                params.append(f"sort_by={request.args.get('sort_by')}")
+            if request.args.get('sort_order'):
+                params.append(f"sort_order={request.args.get('sort_order')}")
+            if params:
+                query_string = '?' + '&'.join(params)
+        
+        result, status = orders_circuit.call(call_orders_service, f'{ORDERS_SERVICE_URL}/v1/orders{query_string}')
         return jsonify(result), status
     except:
         return jsonify({'success': False, 'error': {'code': 'SERVICE_UNAVAILABLE', 'message': 'Orders service temporarily unavailable'}}), 503
@@ -263,6 +284,36 @@ def delete_order(order_id):
 def update_order(order_id):
     try:
         result, status = orders_circuit.call(call_orders_service, f'{ORDERS_SERVICE_URL}/v1/orders/{order_id}', 'PUT', request.json)
+        return jsonify(result), status
+    except:
+        return jsonify({'success': False, 'error': {'code': 'SERVICE_UNAVAILABLE', 'message': 'Orders service temporarily unavailable'}}), 503
+
+@app.route('/v1/orders/<order_id>/status', methods=['PUT'])
+@require_auth
+def update_order_status(order_id):
+    """Обновление только статуса заказа"""
+    try:
+        result, status = orders_circuit.call(call_orders_service, f'{ORDERS_SERVICE_URL}/v1/orders/{order_id}/status', 'PUT', request.json)
+        return jsonify(result), status
+    except:
+        return jsonify({'success': False, 'error': {'code': 'SERVICE_UNAVAILABLE', 'message': 'Orders service temporarily unavailable'}}), 503
+
+@app.route('/v1/orders/stats', methods=['GET'])
+@require_auth
+def get_order_stats():
+    """Статистика заказов (admin)"""
+    try:
+        result, status = orders_circuit.call(call_orders_service, f'{ORDERS_SERVICE_URL}/v1/orders/stats')
+        return jsonify(result), status
+    except:
+        return jsonify({'success': False, 'error': {'code': 'SERVICE_UNAVAILABLE', 'message': 'Orders service temporarily unavailable'}}), 503
+
+@app.route('/v1/orders/my-stats', methods=['GET'])
+@require_auth
+def get_my_order_stats():
+    """Статистика своих заказов"""
+    try:
+        result, status = orders_circuit.call(call_orders_service, f'{ORDERS_SERVICE_URL}/v1/orders/my-stats')
         return jsonify(result), status
     except:
         return jsonify({'success': False, 'error': {'code': 'SERVICE_UNAVAILABLE', 'message': 'Orders service temporarily unavailable'}}), 503

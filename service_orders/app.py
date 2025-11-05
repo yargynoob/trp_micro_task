@@ -6,8 +6,11 @@ from sqlalchemy.orm import Session
 from database import SessionLocal, init_db
 from models import Order
 from auth import require_auth, require_role
+from schemas import OrderCreate, OrderUpdate, OrderStatusUpdate, OrderSearch
+from pydantic import ValidationError
 import uuid
 from decimal import Decimal
+from sqlalchemy import func, and_, or_
 
 app = Flask(__name__)
 CORS(app)
@@ -61,7 +64,7 @@ def get_order(order_id):
 @app.route('/v1/orders', methods=['GET'])
 @require_auth
 def get_orders():
-    """Получение списка заказов с фильтрацией по user_id"""
+    """Получение списка заказов с фильтрацией и пагинацией"""
     db = SessionLocal()
     try:
         user_id = request.user.get('user_id')
@@ -81,13 +84,57 @@ def get_orders():
                 except ValueError:
                     return jsonify({'success': False, 'error': {'code': 'INVALID_UUID', 'message': 'Invalid user ID format'}}), 400
         
+        # Фильтр по статусу
+        status_filter = request.args.get('status')
+        if status_filter:
+            query = query.filter(Order.status == status_filter)
+        
+        # Фильтр по сумме
+        min_amount = request.args.get('min_amount')
+        if min_amount:
+            try:
+                query = query.filter(Order.total_amount >= Decimal(min_amount))
+            except:
+                pass
+        
+        max_amount = request.args.get('max_amount')
+        if max_amount:
+            try:
+                query = query.filter(Order.total_amount <= Decimal(max_amount))
+            except:
+                pass
+        
+        # Сортировка
+        sort_by = request.args.get('sort_by', 'created_at')
+        sort_order = request.args.get('sort_order', 'desc')
+        
+        if sort_by == 'created_at':
+            query = query.order_by(Order.created_at.desc() if sort_order == 'desc' else Order.created_at.asc())
+        elif sort_by == 'total_amount':
+            query = query.order_by(Order.total_amount.desc() if sort_order == 'desc' else Order.total_amount.asc())
+        else:
+            query = query.order_by(Order.created_at.desc())
+        
+        # Подсчет общего количества
+        total = query.count()
+        
         # Пагинация
         page = int(request.args.get('page', 1))
-        per_page = int(request.args.get('per_page', 10))
+        per_page = min(int(request.args.get('per_page', 10)), 100)
         offset = (page - 1) * per_page
         
         orders = query.offset(offset).limit(per_page).all()
-        return jsonify({'success': True, 'data': [order.to_dict() for order in orders]}), 200
+        
+        return jsonify({
+            'success': True,
+            'data': [order.to_dict() for order in orders],
+            'pagination': {
+                'page': page,
+                'per_page': per_page,
+                'total': total,
+                'pages': (total + per_page - 1) // per_page
+            }
+        }), 200
     except Exception as e:
         return jsonify({'success': False, 'error': {'code': 'INTERNAL_ERROR', 'message': str(e)}}), 500
     finally:
@@ -102,14 +149,23 @@ def create_order():
         order_data = request.json
         user_id_from_token = request.user.get('user_id')
         
-        if not order_data.get('items'):
-            return jsonify({'success': False, 'error': {'code': 'VALIDATION_ERROR', 'message': 'items are required'}}), 400
+        # Валидация с Pydantic
+        try:
+            order_create = OrderCreate(**order_data)
+        except ValidationError as e:
+            return jsonify({
+                'success': False,
+                'error': {
+                    'code': 'VALIDATION_ERROR',
+                    'message': str(e.errors()[0]['msg'])
+                }
+            }), 400
         
-        # Используем user_id из токена
+        # Расчет общей суммы
         total_amount = Decimal('0.00')
-        items = order_data.get('items', [])
+        items = [item.dict() for item in order_create.items]
         for item in items:
-            total_amount += Decimal(str(item.get('price', 0))) * Decimal(str(item.get('quantity', 0)))
+            total_amount += Decimal(str(item['price'])) * Decimal(str(item['quantity']))
         
         new_order = Order(
             user_id=uuid.UUID(user_id_from_token),
@@ -196,6 +252,183 @@ def delete_order(order_id):
     except Exception as e:
         db.rollback()
         return jsonify({'success': False, 'error': {'code': 'INTERNAL_ERROR', 'message': str(e)}}), 500
+    finally:
+        db.close()
+
+@app.route('/v1/orders/<order_id>/status', methods=['PUT'])
+@require_auth
+def update_order_status(order_id):
+    """Обновление только статуса заказа"""
+    db = SessionLocal()
+    try:
+        user_id = request.user.get('user_id')
+        user_roles = request.user.get('roles', [])
+        data = request.json
+        
+        # Валидация
+        try:
+            status_update = OrderStatusUpdate(**data)
+        except ValidationError as e:
+            return jsonify({
+                'success': False,
+                'error': {
+                    'code': 'VALIDATION_ERROR',
+                    'message': str(e.errors()[0]['msg'])
+                }
+            }), 400
+        
+        order = db.query(Order).filter(Order.id == uuid.UUID(order_id)).first()
+        if not order:
+            return jsonify({
+                'success': False,
+                'error': {
+                    'code': 'NOT_FOUND',
+                    'message': 'Order not found'
+                }
+            }), 404
+        
+        # Проверка прав доступа
+        if 'admin' not in user_roles and str(order.user_id) != user_id:
+            return jsonify({
+                'success': False,
+                'error': {
+                    'code': 'FORBIDDEN',
+                    'message': 'Access denied'
+                }
+            }), 403
+        
+        # Обычный пользователь может только отменить
+        if 'admin' not in user_roles and status_update.status != 'cancelled':
+            return jsonify({
+                'success': False,
+                'error': {
+                    'code': 'FORBIDDEN',
+                    'message': 'Only cancellation is allowed for regular users'
+                }
+            }), 403
+        
+        order.status = status_update.status
+        db.commit()
+        db.refresh(order)
+        
+        return jsonify({
+            'success': True,
+            'data': order.to_dict()
+        }), 200
+    except ValueError:
+        return jsonify({
+            'success': False,
+            'error': {
+                'code': 'INVALID_UUID',
+                'message': 'Invalid order ID format'
+            }
+        }), 400
+    except Exception as e:
+        db.rollback()
+        return jsonify({
+            'success': False,
+            'error': {
+                'code': 'INTERNAL_ERROR',
+                'message': str(e)
+            }
+        }), 500
+    finally:
+        db.close()
+
+@app.route('/v1/orders/stats', methods=['GET'])
+@require_role('admin')
+def get_order_stats():
+    """Получение статистики по заказам (только admin)"""
+    db = SessionLocal()
+    try:
+        # Общая статистика
+        total_orders = db.query(Order).count()
+        
+        # По статусам
+        created_count = db.query(Order).filter(Order.status == 'created').count()
+        processing_count = db.query(Order).filter(Order.status == 'processing').count()
+        completed_count = db.query(Order).filter(Order.status == 'completed').count()
+        cancelled_count = db.query(Order).filter(Order.status == 'cancelled').count()
+        
+        # Общая сумма
+        total_revenue = db.query(func.sum(Order.total_amount)).filter(Order.status == 'completed').scalar() or 0
+        avg_order_value = db.query(func.avg(Order.total_amount)).scalar() or 0
+        
+        # Последние заказы
+        recent_orders = db.query(Order).order_by(Order.created_at.desc()).limit(5).all()
+        
+        return jsonify({
+            'success': True,
+            'data': {
+                'total_orders': total_orders,
+                'by_status': {
+                    'created': created_count,
+                    'processing': processing_count,
+                    'completed': completed_count,
+                    'cancelled': cancelled_count
+                },
+                'revenue': {
+                    'total': float(total_revenue),
+                    'average_order_value': float(avg_order_value)
+                },
+                'recent_orders': [order.to_dict() for order in recent_orders]
+            }
+        }), 200
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': {
+                'code': 'INTERNAL_ERROR',
+                'message': str(e)
+            }
+        }), 500
+    finally:
+        db.close()
+
+@app.route('/v1/orders/my-stats', methods=['GET'])
+@require_auth
+def get_my_order_stats():
+    """Получение статистики по своим заказам"""
+    db = SessionLocal()
+    try:
+        user_id = request.user.get('user_id')
+        
+        # Статистика пользователя
+        query = db.query(Order).filter(Order.user_id == uuid.UUID(user_id))
+        
+        total_orders = query.count()
+        created_count = query.filter(Order.status == 'created').count()
+        processing_count = query.filter(Order.status == 'processing').count()
+        completed_count = query.filter(Order.status == 'completed').count()
+        cancelled_count = query.filter(Order.status == 'cancelled').count()
+        
+        total_spent = query.filter(Order.status == 'completed').with_entities(func.sum(Order.total_amount)).scalar() or 0
+        
+        # Последние заказы
+        recent_orders = query.order_by(Order.created_at.desc()).limit(5).all()
+        
+        return jsonify({
+            'success': True,
+            'data': {
+                'total_orders': total_orders,
+                'by_status': {
+                    'created': created_count,
+                    'processing': processing_count,
+                    'completed': completed_count,
+                    'cancelled': cancelled_count
+                },
+                'total_spent': float(total_spent),
+                'recent_orders': [order.to_dict() for order in recent_orders]
+            }
+        }), 200
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': {
+                'code': 'INTERNAL_ERROR',
+                'message': str(e)
+            }
+        }), 500
     finally:
         db.close()
 
