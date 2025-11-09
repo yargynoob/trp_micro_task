@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, g
 from flask_cors import CORS
 import os
 from datetime import datetime
@@ -8,6 +8,7 @@ from models import User
 from auth import hash_password, verify_password, create_access_token, require_auth, require_role
 from schemas import UserRegister, UserLogin, UserUpdate, PasswordChange, UserRoleUpdate, UserSearch
 from pydantic import ValidationError
+from logger import logger, log_request, log_response
 import uuid
 
 app = Flask(__name__)
@@ -16,9 +17,17 @@ CORS(app)
 PORT = int(os.environ.get('PORT', 8001))
 
 @app.before_request
-def add_request_id():
-    """Добавление X-Request-ID к каждому запросу"""
-    request.request_id = request.headers.get('X-Request-ID', str(uuid.uuid4()))
+def before_request():
+    """Обработка запроса до маршрутизации"""
+    request_id = request.headers.get('X-Request-ID', str(uuid.uuid4()))
+    g.request_id = request_id
+    request.request_id = request_id
+    log_request()
+
+@app.after_request
+def after_request(response):
+    """Обработка ответа"""
+    return log_response(response)
 
 @app.route('/v1/users/register', methods=['POST'])
 def register():
@@ -67,6 +76,12 @@ def register():
         db.commit()
         db.refresh(new_user)
         
+        logger.info(
+            'User registered successfully',
+            user_id=str(new_user.id),
+            email=new_user.email
+        )
+        
         user_dict = new_user.to_dict()
         return jsonify({
             'success': True,
@@ -77,6 +92,7 @@ def register():
         }), 201
     except Exception as e:
         db.rollback()
+        logger.error('User registration failed', exc_info=e, email=data.get('email'))
         return jsonify({
             'success': False,
             'error': {
@@ -106,6 +122,7 @@ def login():
         
         user = db.query(User).filter(User.email == data['email']).first()
         if not user or not verify_password(data['password'], user.password_hash):
+            logger.warning('Failed login attempt', email=data.get('email'))
             return jsonify({
                 'success': False,
                 'error': {
@@ -116,6 +133,12 @@ def login():
         
         token = create_access_token(str(user.id), user.email, user.roles)
         
+        logger.info(
+            'User logged in successfully',
+            user_id=str(user.id),
+            email=user.email
+        )
+        
         return jsonify({
             'success': True,
             'data': {
@@ -124,6 +147,7 @@ def login():
             }
         }), 200
     except Exception as e:
+        logger.error('Login failed', exc_info=e, email=data.get('email'))
         return jsonify({
             'success': False,
             'error': {
@@ -228,11 +252,9 @@ def get_users():
     """Получение списка пользователей с пагинацией и поиском"""
     db = SessionLocal()
     try:
-        # Параметры пагинации
         page = int(request.args.get('page', 1))
         per_page = min(int(request.args.get('per_page', 10)), 100)
         
-        # Поиск
         query = db.query(User)
         search_query = request.args.get('query', '').strip()
         if search_query:
@@ -242,15 +264,12 @@ def get_users():
                 (User.email.ilike(search_pattern))
             )
         
-        # Фильтр по роли
         role = request.args.get('role')
         if role:
             query = query.filter(User.roles.contains([role]))
         
-        # Подсчет общего количества
         total = query.count()
         
-        # Пагинация
         offset = (page - 1) * per_page
         users = query.offset(offset).limit(per_page).all()
         
@@ -360,7 +379,6 @@ def change_password():
     try:
         data = request.json
         
-        # Валидация
         try:
             password_data = PasswordChange(**data)
         except ValidationError as e:
@@ -384,7 +402,6 @@ def change_password():
                 }
             }), 404
         
-        # Проверка старого пароля
         if not verify_password(password_data.old_password, user.password_hash):
             return jsonify({
                 'success': False,
@@ -394,7 +411,6 @@ def change_password():
                 }
             }), 401
         
-        # Установка нового пароля
         user.password_hash = hash_password(password_data.new_password)
         db.commit()
         
@@ -424,7 +440,6 @@ def update_user_roles(user_id):
     try:
         data = request.json
         
-        # Валидация
         try:
             role_data = UserRoleUpdate(**data)
         except ValidationError as e:
@@ -546,7 +561,6 @@ def get_stats():
         admin_users = db.query(User).filter(User.roles.contains(['admin'])).count()
         regular_users = total_users - admin_users
         
-        # Последние зарегистрированные
         recent_users = db.query(User).order_by(User.created_at.desc()).limit(5).all()
         
         return jsonify({

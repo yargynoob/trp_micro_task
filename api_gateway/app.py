@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, g
 from flask_cors import CORS
 import requests
 import os
@@ -6,15 +6,26 @@ import uuid
 from datetime import datetime, timedelta
 import threading
 from auth_middleware import require_auth, add_auth_headers, is_public_route
+from logger import logger, log_request, log_response
 
 app = Flask(__name__)
 CORS(app)
 
 @app.before_request
-def add_request_id():
-    """Добавление X-Request-ID к каждому запросу"""
-    if not request.headers.get('X-Request-ID'):
-        request.environ['HTTP_X_REQUEST_ID'] = str(uuid.uuid4())
+def before_request():
+    """Обработка запроса до маршрутизации"""
+    # Генерируем или получаем request_id
+    request_id = request.headers.get('X-Request-ID', str(uuid.uuid4()))
+    g.request_id = request_id
+    request.environ['HTTP_X_REQUEST_ID'] = request_id
+    
+    # Логируем запрос
+    log_request()
+
+@app.after_request
+def after_request(response):
+    """Обработка ответа"""
+    return log_response(response)
 
 PORT = int(os.environ.get('PORT', 8000))
 USERS_SERVICE_URL = os.environ.get('USERS_SERVICE_URL', 'http://service_users:8001')
@@ -37,8 +48,9 @@ class CircuitBreaker:
             if self.state == 'open':
                 if datetime.now() - self.last_failure_time > timedelta(seconds=self.reset_timeout):
                     self.state = 'half_open'
-                    print(f'Circuit breaker half-open')
+                    logger.info('Circuit breaker half-open', circuit_name=self.__class__.__name__)
                 else:
+                    logger.warning('Circuit breaker is open', circuit_name=self.__class__.__name__)
                     raise Exception('Circuit breaker is open')
         
         try:
@@ -48,7 +60,7 @@ class CircuitBreaker:
                 if self.state == 'half_open':
                     self.state = 'closed'
                     self.failure_count = 0
-                    print(f'Circuit breaker closed')
+                    logger.info('Circuit breaker closed', circuit_name=self.__class__.__name__)
             return result
         except Exception as e:
             with self.lock:
@@ -57,7 +69,13 @@ class CircuitBreaker:
                 total = self.failure_count + self.success_count
                 if total >= self.min_requests and self.failure_count / total >= self.error_threshold:
                     self.state = 'open'
-                    print(f'Circuit breaker opened after {total} requests')
+                    logger.error(
+                        'Circuit breaker opened',
+                        circuit_name=self.__class__.__name__,
+                        total_requests=total,
+                        failure_count=self.failure_count,
+                        error_rate=self.failure_count / total
+                    )
             raise e
 
 users_circuit = CircuitBreaker()
@@ -66,23 +84,60 @@ orders_circuit = CircuitBreaker()
 def call_users_service(url, method='GET', data=None):
     try:
         headers = add_auth_headers()
+        logger.debug('Calling users service', url=url, method=method)
         response = requests.request(method, url, json=data, headers=headers, timeout=3)
+        
+        logger.info(
+            'Users service response',
+            url=url,
+            method=method,
+            status_code=response.status_code,
+            response_time=response.elapsed.total_seconds()
+        )
+        
         if response.status_code == 404:
             return response.json(), response.status_code
         response.raise_for_status()
         return response.json(), response.status_code
+    except requests.exceptions.RequestException as e:
+        logger.error(
+            'Users service request failed',
+            exc_info=e,
+            url=url,
+            method=method
+        )
+        raise e
     except Exception as e:
+        logger.error('Unexpected error calling users service', exc_info=e)
         raise e
 
 def call_orders_service(url, method='GET', data=None):
     try:
         headers = add_auth_headers()
+        logger.debug('Calling orders service', url=url, method=method)
         response = requests.request(method, url, json=data, headers=headers, timeout=3)
+        
+        logger.info(
+            'Orders service response',
+            url=url,
+            method=method,
+            status_code=response.status_code,
+            response_time=response.elapsed.total_seconds()
+        )
         if response.status_code == 404:
             return response.json(), response.status_code
         response.raise_for_status()
         return response.json(), response.status_code
+    except requests.exceptions.RequestException as e:
+        logger.error(
+            'Orders service request failed',
+            exc_info=e,
+            url=url,
+            method=method
+        )
+        raise e
     except Exception as e:
+        logger.error('Unexpected error calling orders service', exc_info=e)
         raise e
 
 @app.route('/v1/users/register', methods=['POST'])

@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, g
 from flask_cors import CORS
 import os
 from datetime import datetime
@@ -8,6 +8,7 @@ from models import Order
 from auth import require_auth, require_role
 from schemas import OrderCreate, OrderUpdate, OrderStatusUpdate, OrderSearch
 from pydantic import ValidationError
+from logger import logger, log_request, log_response
 import uuid
 from decimal import Decimal
 from sqlalchemy import func, and_, or_
@@ -18,9 +19,17 @@ CORS(app)
 PORT = int(os.environ.get('PORT', 8002))
 
 @app.before_request
-def add_request_id():
-    """Добавление X-Request-ID к каждому запросу"""
-    request.request_id = request.headers.get('X-Request-ID', str(uuid.uuid4()))
+def before_request():
+    """Обработка запроса до маршрутизации"""
+    request_id = request.headers.get('X-Request-ID', str(uuid.uuid4()))
+    g.request_id = request_id
+    request.request_id = request_id
+    log_request()
+
+@app.after_request
+def after_request(response):
+    """Обработка ответа"""
+    return log_response(response)
 
 @app.route('/orders/status', methods=['GET'])
 def status():
@@ -49,7 +58,6 @@ def get_order(order_id):
         if not order:
             return jsonify({'success': False, 'error': {'code': 'NOT_FOUND', 'message': 'Order not found'}}), 404
         
-        # Проверяем права доступа: пользователь видит только свои заказы
         if 'admin' not in user_roles and str(order.user_id) != user_id:
             return jsonify({'success': False, 'error': {'code': 'FORBIDDEN', 'message': 'Access denied'}}), 403
         
@@ -72,11 +80,9 @@ def get_orders():
         
         query = db.query(Order)
         
-        # Admin видит все заказы, обычный пользователь - только свои
         if 'admin' not in user_roles:
             query = query.filter(Order.user_id == uuid.UUID(user_id))
         else:
-            # Admin может фильтровать по userId
             filter_user_id = request.args.get('userId')
             if filter_user_id:
                 try:
@@ -84,12 +90,10 @@ def get_orders():
                 except ValueError:
                     return jsonify({'success': False, 'error': {'code': 'INVALID_UUID', 'message': 'Invalid user ID format'}}), 400
         
-        # Фильтр по статусу
         status_filter = request.args.get('status')
         if status_filter:
             query = query.filter(Order.status == status_filter)
         
-        # Фильтр по сумме
         min_amount = request.args.get('min_amount')
         if min_amount:
             try:
@@ -104,7 +108,6 @@ def get_orders():
             except:
                 pass
         
-        # Сортировка
         sort_by = request.args.get('sort_by', 'created_at')
         sort_order = request.args.get('sort_order', 'desc')
         
@@ -115,10 +118,8 @@ def get_orders():
         else:
             query = query.order_by(Order.created_at.desc())
         
-        # Подсчет общего количества
         total = query.count()
         
-        # Пагинация
         page = int(request.args.get('page', 1))
         per_page = min(int(request.args.get('per_page', 10)), 100)
         offset = (page - 1) * per_page
@@ -149,7 +150,6 @@ def create_order():
         order_data = request.json
         user_id_from_token = request.user.get('user_id')
         
-        # Валидация с Pydantic
         try:
             order_create = OrderCreate(**order_data)
         except ValidationError as e:
@@ -161,7 +161,6 @@ def create_order():
                 }
             }), 400
         
-        # Расчет общей суммы
         total_amount = Decimal('0.00')
         items = [item.dict() for item in order_create.items]
         for item in items:
@@ -178,11 +177,21 @@ def create_order():
         db.commit()
         db.refresh(new_order)
         
+        logger.info(
+            'Order created successfully',
+            order_id=str(new_order.id),
+            user_id=str(new_order.user_id),
+            total_amount=float(new_order.total_amount),
+            items_count=len(items)
+        )
+        
         return jsonify({'success': True, 'data': new_order.to_dict()}), 201
     except ValueError as e:
+        logger.warning('Invalid UUID format', user_id=user_id_from_token)
         return jsonify({'success': False, 'error': {'code': 'INVALID_UUID', 'message': 'Invalid user ID format'}}), 400
     except Exception as e:
         db.rollback()
+        logger.error('Order creation failed', exc_info=e, user_id=user_id_from_token)
         return jsonify({'success': False, 'error': {'code': 'INTERNAL_ERROR', 'message': str(e)}}), 500
     finally:
         db.close()
@@ -265,7 +274,6 @@ def update_order_status(order_id):
         user_roles = request.user.get('roles', [])
         data = request.json
         
-        # Валидация
         try:
             status_update = OrderStatusUpdate(**data)
         except ValidationError as e:
@@ -287,7 +295,6 @@ def update_order_status(order_id):
                 }
             }), 404
         
-        # Проверка прав доступа
         if 'admin' not in user_roles and str(order.user_id) != user_id:
             return jsonify({
                 'success': False,
@@ -297,7 +304,6 @@ def update_order_status(order_id):
                 }
             }), 403
         
-        # Обычный пользователь может только отменить
         if 'admin' not in user_roles and status_update.status != 'cancelled':
             return jsonify({
                 'success': False,
@@ -307,15 +313,26 @@ def update_order_status(order_id):
                 }
             }), 403
         
+        old_status = order.status
         order.status = status_update.status
         db.commit()
         db.refresh(order)
+        
+        logger.info(
+            'Order status updated',
+            order_id=str(order.id),
+            user_id=user_id,
+            old_status=old_status,
+            new_status=order.status,
+            updated_by='admin' if 'admin' in user_roles else 'user'
+        )
         
         return jsonify({
             'success': True,
             'data': order.to_dict()
         }), 200
     except ValueError:
+        logger.warning('Invalid order UUID', order_id=order_id)
         return jsonify({
             'success': False,
             'error': {
@@ -325,6 +342,7 @@ def update_order_status(order_id):
         }), 400
     except Exception as e:
         db.rollback()
+        logger.error('Order status update failed', exc_info=e, order_id=order_id)
         return jsonify({
             'success': False,
             'error': {
@@ -341,20 +359,16 @@ def get_order_stats():
     """Получение статистики по заказам (только admin)"""
     db = SessionLocal()
     try:
-        # Общая статистика
         total_orders = db.query(Order).count()
         
-        # По статусам
         created_count = db.query(Order).filter(Order.status == 'created').count()
         processing_count = db.query(Order).filter(Order.status == 'processing').count()
         completed_count = db.query(Order).filter(Order.status == 'completed').count()
         cancelled_count = db.query(Order).filter(Order.status == 'cancelled').count()
         
-        # Общая сумма
         total_revenue = db.query(func.sum(Order.total_amount)).filter(Order.status == 'completed').scalar() or 0
         avg_order_value = db.query(func.avg(Order.total_amount)).scalar() or 0
         
-        # Последние заказы
         recent_orders = db.query(Order).order_by(Order.created_at.desc()).limit(5).all()
         
         return jsonify({
@@ -393,7 +407,6 @@ def get_my_order_stats():
     try:
         user_id = request.user.get('user_id')
         
-        # Статистика пользователя
         query = db.query(Order).filter(Order.user_id == uuid.UUID(user_id))
         
         total_orders = query.count()
@@ -404,7 +417,6 @@ def get_my_order_stats():
         
         total_spent = query.filter(Order.status == 'completed').with_entities(func.sum(Order.total_amount)).scalar() or 0
         
-        # Последние заказы
         recent_orders = query.order_by(Order.created_at.desc()).limit(5).all()
         
         return jsonify({

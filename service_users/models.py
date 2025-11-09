@@ -16,7 +16,7 @@ class User(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 
     def to_dict(self):
-        """Преобразование модели в словарь (без пароля)"""
+        """Преобразование модели в словарь"""
         return {
             'id': str(self.id),
             'email': self.email,
