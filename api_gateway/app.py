@@ -3,10 +3,11 @@ from flask_cors import CORS
 import requests
 import os
 import uuid
-from datetime import datetime, timedelta
-import threading
+from datetime import datetime
 from auth_middleware import require_auth, add_auth_headers, is_public_route
 from logger import logger, log_request, log_response
+from rate_limiter import rate_limit, global_limiter, auth_limiter, order_creation_limiter
+from circuit_breaker import CircuitBreaker
 
 app = Flask(__name__)
 CORS(app)
@@ -31,55 +32,9 @@ PORT = int(os.environ.get('PORT', 8000))
 USERS_SERVICE_URL = os.environ.get('USERS_SERVICE_URL', 'http://service_users:8001')
 ORDERS_SERVICE_URL = os.environ.get('ORDERS_SERVICE_URL', 'http://service_orders:8002')
 
-class CircuitBreaker:
-    def __init__(self, timeout=3, error_threshold=0.5, reset_timeout=10, min_requests=5):
-        self.timeout = timeout
-        self.error_threshold = error_threshold
-        self.reset_timeout = reset_timeout
-        self.min_requests = min_requests
-        self.failure_count = 0
-        self.success_count = 0
-        self.last_failure_time = None
-        self.state = 'closed'
-        self.lock = threading.Lock()
-    
-    def call(self, func, *args, **kwargs):
-        with self.lock:
-            if self.state == 'open':
-                if datetime.now() - self.last_failure_time > timedelta(seconds=self.reset_timeout):
-                    self.state = 'half_open'
-                    logger.info('Circuit breaker half-open', circuit_name=self.__class__.__name__)
-                else:
-                    logger.warning('Circuit breaker is open', circuit_name=self.__class__.__name__)
-                    raise Exception('Circuit breaker is open')
-        
-        try:
-            result = func(*args, **kwargs)
-            with self.lock:
-                self.success_count += 1
-                if self.state == 'half_open':
-                    self.state = 'closed'
-                    self.failure_count = 0
-                    logger.info('Circuit breaker closed', circuit_name=self.__class__.__name__)
-            return result
-        except Exception as e:
-            with self.lock:
-                self.failure_count += 1
-                self.last_failure_time = datetime.now()
-                total = self.failure_count + self.success_count
-                if total >= self.min_requests and self.failure_count / total >= self.error_threshold:
-                    self.state = 'open'
-                    logger.error(
-                        'Circuit breaker opened',
-                        circuit_name=self.__class__.__name__,
-                        total_requests=total,
-                        failure_count=self.failure_count,
-                        error_rate=self.failure_count / total
-                    )
-            raise e
-
-users_circuit = CircuitBreaker()
-orders_circuit = CircuitBreaker()
+# Создаем улучшенные Circuit Breakers
+users_circuit = CircuitBreaker('users_service', timeout=3, error_threshold=0.5, reset_timeout=10)
+orders_circuit = CircuitBreaker('orders_service', timeout=3, error_threshold=0.5, reset_timeout=10)
 
 def call_users_service(url, method='GET', data=None):
     try:
@@ -141,14 +96,17 @@ def call_orders_service(url, method='GET', data=None):
         raise e
 
 @app.route('/v1/users/register', methods=['POST'])
+@rate_limit(auth_limiter)
 def register():
     try:
         result, status = users_circuit.call(call_users_service, f'{USERS_SERVICE_URL}/v1/users/register', 'POST', request.json)
         return jsonify(result), status
-    except:
+    except Exception as e:
+        logger.error('Register endpoint failed', exc_info=e)
         return jsonify({'success': False, 'error': {'code': 'SERVICE_UNAVAILABLE', 'message': 'Users service temporarily unavailable'}}), 503
 
 @app.route('/v1/users/login', methods=['POST'])
+@rate_limit(auth_limiter)
 def login():
     try:
         result, status = users_circuit.call(call_users_service, f'{USERS_SERVICE_URL}/v1/users/login', 'POST', request.json)
@@ -287,6 +245,7 @@ def get_order(order_id):
 
 @app.route('/v1/orders', methods=['POST'])
 @require_auth
+@rate_limit(order_creation_limiter)
 def create_order():
     try:
         result, status = orders_circuit.call(call_orders_service, f'{ORDERS_SERVICE_URL}/v1/orders', 'POST', request.json)
@@ -388,6 +347,36 @@ def orders_health():
         return jsonify(result), status
     except:
         return jsonify({'error': 'Internal server error'}), 500
+
+@app.route('/health', methods=['GET'])
+def gateway_health():
+    """Проверка здоровья API Gateway"""
+    health_status = {
+        'status': 'OK',
+        'service': 'API Gateway',
+        'timestamp': datetime.utcnow().isoformat() + 'Z',
+        'circuit_breakers': {
+            'users_service': users_circuit.get_stats(),
+            'orders_service': orders_circuit.get_stats()
+        }
+    }
+    return jsonify(health_status), 200
+
+@app.route('/metrics', methods=['GET'])
+@require_auth
+def get_metrics():
+    """Получение метрик системы (требует аутентификации)"""
+    metrics = {
+        'success': True,
+        'data': {
+            'circuit_breakers': {
+                'users_service': users_circuit.get_stats(),
+                'orders_service': orders_circuit.get_stats()
+            },
+            'timestamp': datetime.utcnow().isoformat() + 'Z'
+        }
+    }
+    return jsonify(metrics), 200
 
 @app.route('/v1/users/<user_id>/details', methods=['GET'])
 @require_auth

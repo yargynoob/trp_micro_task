@@ -163,12 +163,20 @@ def create_order():
         
         total_amount = Decimal('0.00')
         items = [item.dict() for item in order_create.items]
+        
+        # Convert Decimal to float for JSON serialization
+        items_for_db = []
         for item in items:
             total_amount += Decimal(str(item['price'])) * Decimal(str(item['quantity']))
+            items_for_db.append({
+                'product': item['product'],
+                'quantity': item['quantity'],
+                'price': float(item['price'])
+            })
         
         new_order = Order(
             user_id=uuid.UUID(user_id_from_token),
-            items=items,
+            items=items_for_db,
             status='created',
             total_amount=total_amount
         )
@@ -223,10 +231,17 @@ def update_order(order_id):
         if 'status' in order_data:
             order.status = order_data['status']
         if 'items' in order_data and 'admin' in user_roles:
-            order.items = order_data['items']
+            # Convert Decimal to float for JSON serialization
+            items_for_db = []
             total_amount = Decimal('0.00')
             for item in order_data['items']:
                 total_amount += Decimal(str(item.get('price', 0))) * Decimal(str(item.get('quantity', 0)))
+                items_for_db.append({
+                    'product': item.get('product'),
+                    'quantity': item.get('quantity'),
+                    'price': float(item.get('price', 0))
+                })
+            order.items = items_for_db
             order.total_amount = total_amount
         
         db.commit()

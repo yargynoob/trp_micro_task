@@ -1,0 +1,400 @@
+openapi: 3.0.3
+info:
+  title: Microservices API
+  description: |
+    API для управления пользователями и заказами в микросервисной архитектуре.
+    
+    ## Аутентификация
+    Используется JWT токен в заголовке Authorization: Bearer <token>
+    
+    ## Rate Limiting
+    - Регистрация/вход: 10 запросов в минуту
+    - Создание заказов: 20 запросов в минуту
+    - Остальные: 100 запросов в минуту
+  version: 1.0.0
+  contact:
+    name: API Support
+    email: support@example.com
+
+servers:
+  - url: http://localhost:8080
+    description: Development server
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  
+  schemas:
+    Error:
+      type: object
+      properties:
+        success:
+          type: boolean
+          example: false
+        error:
+          type: object
+          properties:
+            code:
+              type: string
+            message:
+              type: string
+    
+    User:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        email:
+          type: string
+          format: email
+        name:
+          type: string
+        roles:
+          type: array
+          items:
+            type: string
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    
+    Order:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        user_id:
+          type: string
+          format: uuid
+        items:
+          type: array
+          items:
+            type: object
+            properties:
+              product:
+                type: string
+              quantity:
+                type: integer
+              price:
+                type: number
+        status:
+          type: string
+          enum: [created, processing, completed, cancelled]
+        total_amount:
+          type: number
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+tags:
+  - name: Authentication
+    description: Регистрация и аутентификация пользователей
+  - name: Users
+    description: Управление пользователями
+  - name: Orders
+    description: Управление заказами
+  - name: Monitoring
+    description: Мониторинг и метрики
+
+paths:
+  /v1/users/register:
+    post:
+      tags:
+        - Authentication
+      summary: Регистрация пользователя
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - email
+                - password
+                - name
+              properties:
+                email:
+                  type: string
+                  format: email
+                password:
+                  type: string
+                  minLength: 6
+                name:
+                  type: string
+                  minLength: 2
+      responses:
+        '201':
+          description: Пользователь зарегистрирован
+        '400':
+          description: Ошибка валидации
+        '429':
+          description: Превышен лимит запросов
+
+  /v1/users/login:
+    post:
+      tags:
+        - Authentication
+      summary: Вход пользователя
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - email
+                - password
+              properties:
+                email:
+                  type: string
+                  format: email
+                password:
+                  type: string
+      responses:
+        '200':
+          description: Успешный вход
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  data:
+                    type: object
+                    properties:
+                      token:
+                        type: string
+                      user:
+                        $ref: '#/components/schemas/User'
+        '401':
+          description: Неверные учетные данные
+        '429':
+          description: Превышен лимит запросов
+
+  /v1/users/profile:
+    get:
+      tags:
+        - Users
+      summary: Получить профиль текущего пользователя
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          description: Профиль пользователя
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  data:
+                    $ref: '#/components/schemas/User'
+        '401':
+          description: Не авторизован
+
+  /v1/users:
+    get:
+      tags:
+        - Users
+      summary: Получить список пользователей (только admin)
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: page
+          in: query
+          schema:
+            type: integer
+            default: 1
+        - name: per_page
+          in: query
+          schema:
+            type: integer
+            default: 10
+      responses:
+        '200':
+          description: Список пользователей
+        '403':
+          description: Доступ запрещен
+
+  /v1/orders:
+    get:
+      tags:
+        - Orders
+      summary: Получить список заказов
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: page
+          in: query
+          schema:
+            type: integer
+        - name: per_page
+          in: query
+          schema:
+            type: integer
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [created, processing, completed, cancelled]
+        - name: min_amount
+          in: query
+          schema:
+            type: number
+        - name: max_amount
+          in: query
+          schema:
+            type: number
+      responses:
+        '200':
+          description: Список заказов
+    
+    post:
+      tags:
+        - Orders
+      summary: Создать заказ
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - items
+              properties:
+                items:
+                  type: array
+                  items:
+                    type: object
+                    required:
+                      - product
+                      - quantity
+                      - price
+                    properties:
+                      product:
+                        type: string
+                      quantity:
+                        type: integer
+                        minimum: 1
+                      price:
+                        type: number
+                        minimum: 0.01
+      responses:
+        '201':
+          description: Заказ создан
+        '400':
+          description: Ошибка валидации
+        '429':
+          description: Превышен лимит запросов
+
+  /v1/orders/{orderId}:
+    get:
+      tags:
+        - Orders
+      summary: Получить заказ по ID
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: orderId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Информация о заказе
+        '404':
+          description: Заказ не найден
+
+  /v1/orders/{orderId}/status:
+    put:
+      tags:
+        - Orders
+      summary: Обновить статус заказа
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: orderId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - status
+              properties:
+                status:
+                  type: string
+                  enum: [created, processing, completed, cancelled]
+      responses:
+        '200':
+          description: Статус обновлен
+        '403':
+          description: Недостаточно прав
+
+  /v1/orders/stats:
+    get:
+      tags:
+        - Orders
+      summary: Статистика заказов (только admin)
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          description: Статистика заказов
+        '403':
+          description: Доступ запрещен
+
+  /health:
+    get:
+      tags:
+        - Monitoring
+      summary: Проверка здоровья API Gateway
+      responses:
+        '200':
+          description: Система работает
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                  service:
+                    type: string
+                  timestamp:
+                    type: string
+                  circuit_breakers:
+                    type: object
+
+  /metrics:
+    get:
+      tags:
+        - Monitoring
+      summary: Метрики системы
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          description: Метрики Circuit Breakers
